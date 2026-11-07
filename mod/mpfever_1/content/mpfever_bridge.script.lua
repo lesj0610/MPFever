@@ -18085,6 +18085,8 @@ end
 
 G.coNewsText = function(reg, n)
 	local function nm(id) return G.coName(reg, id) end
+	-- [PvE] (tf3-pve patch) a news of the PvE mode carries its own text (mpfever_eco.lua)
+	if type(n.pveText) == "string" and n.pveText ~= "" then return n.pveText end
 	local k = n.kind
 	if k == "bankrupt" then return C.Tf("%s fait faillite : %s lot(s) mis aux enchères. Ses joueurs reçoivent une nouvelle entreprise.", "%s goes bankrupt: %s lot(s) put up for auction. Its players get a new company.", nm(n.co), n.lots or 0) end
 	if k == "debt" then
@@ -19712,6 +19714,69 @@ G.streetVeto = function(id, name, param)
 	return nil
 end
 
+-- [PvE] (tf3-pve patch) The PvE demolition rules for this player's tools (MPFEVER_PVE=1): a tool's proposal is turned down before the
+-- click when it would take down a town building (MPFEVER_PVE_DEMOLISH_TOWN=1 allows it), an industry (MPFEVER_PVE_DEMOLISH_INDUSTRY=1)
+-- or, with the bulldozer, a street no company owns: the map's and the towns' own roads (MPFEVER_PVE_DEMOLISH_ROAD=1). Upgrading or
+-- joining such a street stays allowed. The answer is the one the game's own scripts give (errorMessages: the tool shows it in red
+-- and does not build), as G.streetVeto. Anything failing here answers nothing.
+G.pveVeto = function(id, name, param)
+	if os.getenv("MPFEVER_PVE") ~= "1" or name ~= "builder.proposalCreate" then return nil end
+	local allowTown = os.getenv("MPFEVER_PVE_DEMOLISH_TOWN") == "1"
+	local allowInd = os.getenv("MPFEVER_PVE_DEMOLISH_INDUSTRY") == "1"
+	local allowRoad = os.getenv("MPFEVER_PVE_DEMOLISH_ROAD") == "1"
+	if allowTown and allowInd and allowRoad then return nil end
+	local p = param and param[1]
+	local crit = false
+	pcall(function() crit = param[2].errorState.critical == true end)
+	if p == nil or crit then return nil end
+	local CT = api.type.ComponentType
+	local TOWN_TXT = "PvE 규칙: 마을 건물은 철거할 수 없습니다."
+	local why = nil
+	if not allowTown then
+		local n = 0
+		pcall(function() n = #param[2].collisionInfo.buildingEntities end)
+		if n > 0 then why = TOWN_TXT end
+	end
+	if not why and not (allowTown and allowInd) then
+		local rm, cnt = nil, 0
+		pcall(function() rm = p.toRemove; cnt = #rm end)
+		for i = 1, cnt do
+			local e = nil
+			pcall(function() e = rm[i] end)
+			if type(e) == "number" and e >= 0 then
+				local town, ind = false, false
+				pcall(function() town = api.engine.getComponent(e, CT.TOWN_BUILDING) ~= nil end)
+				if not town then pcall(function() local cc = api.engine.getComponent(e, CT.CONSTRUCTION); town = cc ~= nil and #cc.townBuildings > 0 end) end
+				if not town then pcall(function() ind = api.engine.getComponent(e, CT.INDUSTRY) ~= nil end) end
+				if not (town or ind) then pcall(function() local cc = api.engine.getComponent(e, CT.CONSTRUCTION); ind = cc ~= nil and #cc.simBuildings > 0 end) end
+				if not (town or ind) then pcall(function() local cc = api.engine.getComponent(e, CT.CONSTRUCTION); ind = cc ~= nil and tostring(cc.fileName):find("industry/", 1, true) ~= nil end) end
+				if town and not allowTown then why = TOWN_TXT break end
+				if ind and not allowInd then why = "PvE 규칙: 산업 시설은 철거할 수 없습니다." break end
+			end
+		end
+	end
+	if not why and not allowRoad and tostring(id) == "bulldozer" then
+		local removed, cnt = nil, 0
+		pcall(function() removed = p.proposal.removedSegments; cnt = #removed end)
+		for i = 1, cnt do
+			local e = nil
+			pcall(function() e = removed[i].entity end)
+			if type(e) == "number" and e >= 0 then
+				local street, owner = false, nil
+				pcall(function() street = api.engine.getComponent(e, CT.BASE_EDGE_STREET) ~= nil end)
+				if street then pcall(function() local po = api.engine.getComponent(e, CT.PLAYER_OWNED); owner = po and po.player or nil end) end
+				if street and not (type(owner) == "number" and owner >= 0) then why = "PvE 규칙: 기존 도로(마을 도로, 공용 도로)는 철거할 수 없습니다. 개량과 연결은 됩니다." break end
+			end
+		end
+	end
+	if why then
+		G.pveVetoN = (G.pveVetoN or 0) + 1
+		if G.pveVetoN <= 3 or G.pveVetoN % 100 == 0 then log("[PvE] the " .. tostring(id) .. " tool's proposal turned down here: " .. why) end
+		return { errorMessages = { [why] = true }, skipRender = false }
+	end
+	return nil
+end
+
 local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 	if not C.ACTIVE then return end
 	-- (a map signal armed in the MPFever window: the next click on the map places it, see G.pingArm)
@@ -19758,6 +19823,11 @@ local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 	-- click, a station, stop or depot in another company's territory, the vehicle store's buy button off, a line kept), returned
 	-- as the game's own scripts return theirs. Only while a module on answers (G.featVeto); nothing while no option is on: no
 	-- answer, as before. MPFEVER_FEATVETO=0 (K.FEATVETO false) or MPFEVER_FEAT=0: never
+	-- [PvE] the PvE demolition rules first (G.pveVeto)
+	do
+		local okP, rp = pcall(G.pveVeto, id, name, param)
+		if okP and rp ~= nil then return rp end
+	end
 	do
 		local okS, rs = pcall(G.streetVeto, id, name, param)
 		if okS and rs ~= nil then return rs end

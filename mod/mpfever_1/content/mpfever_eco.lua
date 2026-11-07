@@ -98,6 +98,17 @@ end
 -- floor, its sales and its loan). Read once, every game is started with the same value (MPFEVER_AINOBANKRUPT=0: as before, a
 -- computer company goes bankrupt as a player's does)
 E.AI_NO_BANKRUPT = os.getenv("MPFEVER_AINOBANKRUPT") ~= "0"
+-- [PvE] (tf3-pve patch) The PvE mode (MPFEVER_PVE=1): the computer companies go bankrupt after the host's months in debt, the
+-- players never do (as in the base game). MPFEVER_PVE_REMOVE=1: a bankrupt computer company's assets are removed at once, its
+-- tracks and signals too, without an auction (else MPFever's auction, as before). Its roads stay (the towns use them).
+E.PVE = os.getenv("MPFEVER_PVE") == "1"
+E.PVE_REMOVE = E.PVE and os.getenv("MPFEVER_PVE_REMOVE") == "1"
+if E.PVE then E.AI_NO_BANKRUPT = false end
+-- [PvE] whether a company's months in debt count (and may end in a bankruptcy): in PvE the computer companies' only
+function E.pveCounts(c)
+	if E.PVE then return E.isAi(c) end
+	return not (E.AI_NO_BANKRUPT and E.isAi(c))
+end
 
 -- (the game time and the bridge's helpers, given by the bridge at every call: see E.event and E.tick)
 E.env = nil
@@ -718,9 +729,141 @@ function E.closeAll(st, env)
 	E.finishAuction(st, env)
 end
 
+-- ---------------------------------------------------------------- [PvE] (tf3-pve patch)
+-- a company's name as the players see it (the game's name of its player entity, else the registry's)
+function E.pveName(c)
+	local n = nil
+	pcall(function() n = api.engine.getComponent(c.ent, api.type.ComponentType.NAME).name end)
+	if type(n) == "string" and n ~= "" then return n end
+	if type(c.name) == "string" and c.name ~= "" then return c.name end
+	return "#" .. tostring(c.id)
+end
+
+-- [PvE] the track segments a company owns that belong to no construction (a station's or a depot's own tracks go with it),
+-- sorted. A track: a segment without a street component (see E.TRACK_STREET)
+function E.pveTracksOf(env, ent)
+	local CT = api.type.ComponentType
+	local frozen = {}
+	for _, e in ipairs(env.R.entitiesWith("CONSTRUCTION")) do
+		pcall(function()
+			local po = api.engine.getComponent(e, CT.PLAYER_OWNED)
+			if not (po and po.player == ent) then return end
+			local cc = api.engine.getComponent(e, CT.CONSTRUCTION)
+			for i = 1, #(cc.frozenEdges or {}) do frozen[cc.frozenEdges[i]] = true end
+		end)
+	end
+	local out = {}
+	for _, e in ipairs(env.R.allEdges()) do
+		pcall(function()
+			if frozen[e] then return end
+			if api.engine.getComponent(e, CT.BASE_EDGE) == nil then return end
+			if api.engine.getComponent(e, CT.BASE_EDGE_STREET) ~= nil then return end
+			local po = api.engine.getComponent(e, CT.PLAYER_OWNED)
+			if po and po.player == ent then out[#out + 1] = e end
+		end)
+	end
+	table.sort(out)
+	return out
+end
+
+-- [PvE] the tracks (and their signals) of a bankrupt computer company, removed by the engine's own removal proposal; run a moment
+-- after its stations and depots went (E.tick, reg.pveJobs), so that the proposal is made on the network without them
+function E.pveRemoveTracks(st, env, coId)
+	local reg = st.co
+	local c = env.CO.find(reg, coId)
+	if not (c and c.ent) then return end
+	local list = E.pveTracksOf(env, c.ent)
+	if #list == 0 then env.log("companies: [PvE] company " .. tostring(coId) .. ": no track left to remove"); return end
+	local ok, err = pcall(function()
+		local P = api.engine.util.proposal.makeSegmentsRemoveProposal(list)
+		local ctx = api.type.Context.new()
+		ctx.player = c.ent
+		ctx.checkTerrainAlignment = false
+		api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd(P, ctx, true, false))
+	end)
+	if not ok then
+		-- (no removal proposal in this state: the segments as a plain street proposal, the engine takes their signals with them)
+		local ok2, err2 = pcall(function()
+			local sp = api.type.SimpleProposal.new()
+			local ssp = sp.streetProposal
+			ssp.edgesToRemove = list
+			sp.streetProposal = ssp
+			local ctx = api.type.Context.new()
+			ctx.player = c.ent
+			ctx.checkTerrainAlignment = false
+			ctx.cleanupStreetGraph = true
+			api.cmd.sendCommand(api.cmd.makeWorldBuildProposalCmd(sp, ctx, true, false))
+		end)
+		ok, err = ok2, tostring(err) .. " / " .. tostring(err2)
+	end
+	env.log("companies: [PvE] company " .. tostring(coId) .. ": " .. #list .. " track segment(s) " .. (ok and "sent for removal" or ("NOT removed: " .. tostring(err))))
+end
+
+-- [PvE] a bankrupt computer company's assets, removed at once without an auction (MPFEVER_PVE_REMOVE=1): its lines with their
+-- vehicles, its stations and depots (as unsold lots), what vehicles and lines are left, then its tracks a moment later. Its roads
+-- stay. (Its street stops, which are no construction, stay too, as after MPFever's auction: MPFever keeps from demolishing them,
+-- see MPFEVER_AIDEMOLISH in mpfever_ai.lua.)
+function E.pveRemove(st, c, env)
+	local reg = st.co
+	local lots = E.lotsOf(env, c)
+	local nV, nL = 0, 0
+	E.handing = {}
+	local ok, err = pcall(function()
+		for _, lot in ipairs(lots) do
+			demolish(env, c, lot)
+			dropLotRule(reg, lot)
+		end
+		for _, e in ipairs(E.ownedBy(env, c.ent)) do
+			if not E.handing[e] then
+				local okV, tv = pcall(api.engine.getComponent, e, api.type.ComponentType.TRANSPORT_VEHICLE)
+				if okV and tv then
+					E.handing[e] = true
+					nV = nV + 1
+					pcall(function() api.cmd.sendCommand(api.cmd.makeVehicleSellCmd({ e })) end)
+				else
+					local okL, ln = pcall(api.engine.getComponent, e, api.type.ComponentType.LINE)
+					if okL and ln then
+						E.handing[e] = true
+						nL = nL + 1
+						pcall(function() api.cmd.sendCommand(api.cmd.makeLineDestroyCmd(e)) end)
+					end
+				end
+			end
+		end
+	end)
+	E.handing = nil
+	if not ok then env.log("companies: [PvE] removal of company " .. tostring(c.id) .. " failed: " .. tostring(err)) end
+	reg.pveJobs = reg.pveJobs or {}
+	reg.pveJobs[#reg.pveJobs + 1] = { co = c.id, at = gt() + 3000 }
+	news(reg, { kind = "pve_removed", co = c.id,
+		pveText = E.pveName(c) .. " 파산! 경매 없이 노선, 차량, 역과 차량기지를 제거했습니다. 선로도 곧 제거됩니다. 이 회사는 게임에서 탈락합니다." })
+	env.log("companies: [PvE] company " .. tostring(c.id) .. " removed at once: " .. #lots .. " lot(s) demolished, " .. nV .. " vehicle(s) and "
+		.. nL .. " line(s) left over taken away; its tracks follow")
+end
+
+-- [PvE] every computer company of the lobby (the host's rules, "n:colour:level[:money],...") out of the game: the player wins
+function E.pveCheckWin(st, env)
+	local reg = st.co
+	if not E.PVE or reg.pveWon then return end
+	local want = {}
+	for part in tostring((reg.rules or {}).ai or ""):gmatch("[^,;]+") do
+		local n = part:match("^%s*(%d+):")
+		if n then want[#want + 1] = "ai:" .. n end
+	end
+	if #want == 0 then return end
+	for _, k in ipairs(want) do
+		if not (type(reg.pveOut) == "table" and reg.pveOut[k]) then return end
+	end
+	reg.pveWon = true
+	news(reg, { kind = "pve_win", pveText = "승리! 모든 AI 경쟁사가 파산했습니다. 계속 플레이하거나, 저장한 뒤 종료하세요." })
+	env.log("companies: [PvE] every computer company is out of the game: the player wins")
+end
+
 -- ---------------------------------------------------------------- bankruptcy
 function E.bankrupt(st, c, env, maxLots)
 	local reg = st.co
+	-- [PvE] (read before its members go)
+	local pveAi = E.PVE and E.isAi(c)
 	c.gone = "bankrupt"
 	c.debt = nil
 	local mem = env.CO.ensureMembers(c)
@@ -729,6 +872,27 @@ function E.bankrupt(st, c, env, maxLots)
 	c.formerMembers = names
 	c.members = {}
 	c.chief = nil
+	-- [PvE] a computer company that goes bankrupt is out of the game: never started again (see mpfever_ai.lua, reg.pveOut);
+	-- removed at once without an auction when the host chose so (MPFEVER_PVE_REMOVE=1)
+	if pveAi then
+		reg.pveOut = reg.pveOut or {}
+		-- (its keys, and each one without the "@..." a name taken twice gets: the AI module knows it as "ai:<n>")
+		local function out(k)
+			k = tostring(k or "")
+			if k:sub(1, 3) == "ai:" then
+				reg.pveOut[k] = true
+				reg.pveOut[(k:gsub("@.*$", ""))] = true
+			end
+		end
+		for _, k in ipairs(names) do out(k) end
+		out(c.key)
+		env.log("companies: [PvE] computer company " .. tostring(c.id) .. " is out of the game")
+		if E.PVE_REMOVE then
+			E.pveRemove(st, c, env)
+			E.pveCheckWin(st, env)
+			return
+		end
+	end
 	local lots = E.lotsOf(env, c)
 	-- (autotests: the first lots only)
 	if maxLots then while #lots > maxLots do table.remove(lots) end end
@@ -741,13 +905,17 @@ function E.bankrupt(st, c, env, maxLots)
 		if mode == "company" and #lots > 0 then lots = { E.companyLot(env, c, lots, c.ent and nameOf(c.ent) or nil) } end
 		reg.auction = { v = 2, seq = reg.auctionSeq, co = c.id, mode = mode, minutes = mins, lots = lots, openAt = gt(), bids = 0, bidders = {} }
 	end
-	news(reg, { kind = "bankrupt", co = c.id, lots = #lots, mode = mode, minutes = mode ~= "serial" and mins or nil })
+	news(reg, { kind = "bankrupt", co = c.id, lots = #lots, mode = mode, minutes = mode ~= "serial" and mins or nil,
+		-- [PvE] (a computer company does not start again)
+		pveText = pveAi and (E.pveName(c) .. " 파산! 자산 " .. #lots .. "건이 경매에 나왔습니다. 이 회사는 게임에서 탈락합니다.") or nil })
 	env.log("companies: company " .. c.id .. " is BANKRUPT (in debt for " .. tostring((reg.rules or {}).bankrupt or E.BANKRUPT_DEFAULT)
 		.. " months): " .. #lots .. " lot(s) at auction (" .. mode .. (mode ~= "serial" and (", " .. mins .. " min") or "") .. "); its players get a new company")
 	if #lots == 0 then
 		-- (0.7.4: nothing to sell, its tracks and roads still go to the heir)
 		if reg.auction.v == 2 then E.closeAll(st, env) else E.finishAuction(st, env) end
 	end
+	-- [PvE] the last computer company gone: the player wins
+	if pveAi then E.pveCheckWin(st, env) end
 end
 
 function E.finishAuction(st, env)
@@ -804,6 +972,13 @@ function E.tick(st, env)
 			reg.month = m
 			changed = true
 		end
+	end
+	-- [PvE] the tracks of a computer company removed at once (E.pveRemove), a moment after its stations and depots
+	if E.PVE and type(reg.pveJobs) == "table" and #reg.pveJobs > 0 and gt() >= (tonumber(reg.pveJobs[1].at) or 0) then
+		local job = table.remove(reg.pveJobs, 1)
+		local okR, errR = pcall(E.pveRemoveTracks, st, env, job.co)
+		if not okR then env.log("companies: [PvE] track removal failed: " .. tostring(errR)) end
+		changed = true
 	end
 	local okT, ch = pcall(E.tolls, st, env)
 	if okT and ch then changed = true elseif not okT then env.log("companies: tolls failed: " .. tostring(ch)) end
@@ -1459,7 +1634,7 @@ function E.event(st, name, param, env)
 		for _, c in ipairs(reg.list) do
 			if live(c) and #env.CO.members(c) > 0 then
 				-- (0.6: a computer company's months in debt are not counted, see E.AI_NO_BANKRUPT; a count of an earlier version goes)
-				if inDebt[c.id] and not (E.AI_NO_BANKRUPT and E.isAi(c)) then
+				if inDebt[c.id] and E.pveCounts(c) then -- [PvE] (was: not (E.AI_NO_BANKRUPT and E.isAi(c)))
 					c.debt = (c.debt or 0) + 1
 					news(reg, { kind = "debt", co = c.id, months = c.debt, limit = limit })
 				else
@@ -1469,7 +1644,7 @@ function E.event(st, name, param, env)
 		end
 		if limit > 0 and not reg.auction then
 			for _, c in ipairs(reg.list) do
-				if live(c) and (c.debt or 0) >= limit and not (E.AI_NO_BANKRUPT and E.isAi(c)) then E.bankrupt(st, c, env) break end
+				if live(c) and (c.debt or 0) >= limit and E.pveCounts(c) then E.bankrupt(st, c, env) break end -- [PvE]
 			end
 		end
 	elseif name == "co_test" then

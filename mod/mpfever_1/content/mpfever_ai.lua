@@ -5223,6 +5223,45 @@ function M.retiredBy(st, key)
 	return type(S) == "table" and type(S.retired) == "table" and S.retired[tostring(key)] == true
 end
 
+-- [PvE] (tf3-pve patch) The computer companies' styles in PvE (MPFEVER_PVE=1, MPFEVER_PVE_STYLE="1:aggressive,2:balanced,3:conservative",
+-- the lobby's numbers): how freely each one grows, on top of its level (Easy, Normal, Hard). Multipliers of the level's money
+-- kept back, money to spare before growing, waits; steps added to its first lines and lines still filling. A copy of the level is
+-- changed, never the level itself; its name stays the level's (the code compares it).
+M.PVE_STYLES = {
+	aggressive = { reserve = 0.6, freeCash = 0.5, settle = 0.5, pause = 0.5, bootstrap = 1, maxUnproven = 1, addMargin = -0.05, giveUp = 0.85, compete = true },
+	conservative = { reserve = 1.5, freeCash = 1.5, settle = 1.5, pause = 1.5, bootstrap = -1, maxUnproven = -1, addMargin = 0.1, giveUp = 1.15, compete = false },
+}
+function M.pveStyleOf(n)
+	if os.getenv("MPFEVER_PVE") ~= "1" then return nil end
+	for part in tostring(os.getenv("MPFEVER_PVE_STYLE") or ""):gmatch("[^,;]+") do
+		local k, s = part:match("^%s*(%d+)%s*:%s*(%a+)%s*$")
+		if k and tonumber(k) == n then
+			s = s:lower()
+			if M.PVE_STYLES[s] then return s end
+			return nil
+		end
+	end
+	return nil
+end
+function M.pveStyled(lv, n)
+	local s = M.pveStyleOf(n)
+	local d = s and M.PVE_STYLES[s]
+	if not d then return lv, nil end
+	local out = {}
+	for k, v in pairs(lv) do out[k] = v end
+	out.reserve = math.floor(lv.reserve * d.reserve)
+	out.freeCash = math.floor(lv.freeCash * d.freeCash)
+	out.settle = math.floor(lv.settle * d.settle)
+	out.pause = math.floor((lv.pause or 600) * d.pause)
+	out.bootstrap = math.max(1, (lv.bootstrap or 1) + d.bootstrap)
+	out.maxUnproven = math.max(1, (lv.maxUnproven or 1) + d.maxUnproven)
+	out.addMargin = math.max(1.0, (lv.addMargin or 1.15) + d.addMargin)
+	out.giveUp = math.min(0.95, (lv.giveUp or 0.5) * d.giveUp)
+	out.compete = d.compete
+	out.style = s
+	return out, s
+end
+
 function M.tick(E, st)
 	local G, C = E.G, E.C
 	if C.ROLE ~= "host" or G.cmode ~= "separate" then return end
@@ -5261,11 +5300,22 @@ function M.tick(E, st)
 	if not cur then return end
 	G.AI = G.AIS[cur.n]
 	LV = LEVELS[cur.level or 2] or LEVELS[2]
+	-- [PvE] its style (MPFEVER_PVE_STYLE), on a copy of its level
+	local pveStyle
+	LV, pveStyle = M.pveStyled(LV, cur.n)
 	RESERVE = LV.reserve
 	FLOOR = FLOOR_MIN
 	G.AI.lookAt = G.frames + LV.tick
 	if G.AI.levelSaid ~= LV.name then G.AI.levelSaid = LV.name; E.log("AI" .. cur.n .. " level " .. LV.name) end
+	if pveStyle and G.AI.styleSaid ~= pveStyle then G.AI.styleSaid = pveStyle; E.log("AI" .. cur.n .. " [PvE] style " .. pveStyle) end
 	AINUM, AIKEY = cur.n, "ai:" .. cur.n
+	-- [PvE] a computer company that went bankrupt is out of the game: not announced again as a new company (mpfever_eco.lua,
+	-- reg.pveOut, the same registry the simulation keeps)
+	if os.getenv("MPFEVER_PVE") == "1" and type(G.co) == "table" and type(G.co.pveOut) == "table" and G.co.pveOut[AIKEY] then
+		if not G.AI.pveOutSaid then G.AI.pveOutSaid = true; L(E, "[PvE] bankrupt: out of the game, not started again") end
+		G.AI.lookAt = G.frames + 3600
+		return
+	end
 	-- (0.6) a computer company taken over on the stock market (the game option "stock", mpfever_feat_stock.lua: its key in
 	-- st.feat.stock.retired, the same on every game) stays retired: it is not announced again as a new company of that key.
 	-- Nothing of it while the option was never used. MPFEVER_STOCKRETIRE=0: announced again, as without the check

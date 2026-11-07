@@ -44,6 +44,9 @@ for %%f in (README INSTALL ROADMAP CHANGELOG PRIVACY) do copy /y docs\%%f.txt "%
 copy /y LICENSE "%DIST%\LICENSE.txt" >nul || exit /b 1
 copy /y NOTICE.txt "%DIST%\" >nul || exit /b 1
 xcopy /e /i /q /y mod\mpfever_1 "%DIST%\mod\mpfever_1" >nul || exit /b 1
+rem (PvE) the PvE start file and its notes, next to MPFever.exe
+copy /y pve\Start-PvE.bat "%DIST%\" >nul || exit /b 1
+copy /y pve\README-PvE.txt "%DIST%\" >nul || exit /b 1
 if exist "release\MPFever-%VERSION%.zip" del "release\MPFever-%VERSION%.zip"
 rem standard zip entries (forward slashes in the central directory and in every local header: ZipFile.CreateFromDirectory of
 rem Windows PowerShell 5 left backslashes in the local headers, and some Linux archive managers made flat files of them, issue #93)
